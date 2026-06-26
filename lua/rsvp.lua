@@ -1,6 +1,8 @@
 ---@class RsvpModule
 local M = {}
 
+local common_words = require("rsvp.common_words")
+
 local TIMER_SENSITIVITY = 100
 
 local hl_ns = vim.api.nvim_create_namespace("rsvp_hl")
@@ -11,6 +13,7 @@ local HL_GROUPS = {
   paused = "RsvpPaused",
   done = "RsvpDone",
   ghost_text = "RsvpGhostText",
+  breather = "RsvpBreather",
 }
 
 local default_highlights = {
@@ -19,6 +22,7 @@ local default_highlights = {
   paused = { fg = "#FFFF00", bold = true },
   done = { fg = "#00FF00", bold = true },
   ghost_text = { link = "NonText" },
+  breather = { fg = "#FFA500", bold = true },
 }
 
 local LINE_INDICES = {
@@ -40,6 +44,14 @@ local keymaps = {
   next_step = "L",
 }
 
+---@class RsvpToken
+---@field word string display string, exactly as the accepted token (keeps surrounding chars)
+---@field core string alphanumeric-stripped core (used for complexity + ORP)
+---@field trailing_punct string trailing non-alphanumeric run, e.g. "", ",", ".", "?!"
+---@field boundary "none"|"clause"|"sentence"
+---@field paragraph_end boolean a blank line follows this token in the source
+---@field complexity number cached display-time multiplier
+
 ---@class State
 ---@field buf integer
 ---@field win integer
@@ -47,14 +59,17 @@ local keymaps = {
 ---@field elapsed_timer? uv.uv_timer_t
 ---@field elapsed_ticks integer
 ---@field words string[]
+---@field tokens RsvpToken[]
 ---@field current_index integer
 ---@field running boolean
 ---@field finished boolean
+---@field in_paragraph_pause boolean
 ---@field wpm integer
 local initial_state = {
   current_index = 1,
   running = false,
   finished = false,
+  in_paragraph_pause = false,
   wpm = 300,
   elapsed_ticks = 0,
 }
@@ -70,6 +85,35 @@ local state = vim.deepcopy(initial_state)
 ---@field paused? RsvpHighlightOpts
 ---@field done? RsvpHighlightOpts
 ---@field ghost_text? RsvpHighlightOpts
+---@field breather? RsvpHighlightOpts
+
+---@class ComplexityWeights
+---@field length_medium number
+---@field length_long number
+---@field length_very_long number
+---@field has_digit number
+---@field has_symbol number
+---@field mixed_case number
+---@field all_caps number
+
+---@class ComplexityWordList
+---@field enabled boolean
+
+---@class ComplexityScaling
+---@field enabled boolean
+---@field min_multiplier number
+---@field max_multiplier number
+---@field common_word_multiplier number
+---@field word_list ComplexityWordList
+---@field weights ComplexityWeights
+
+---@class Breather
+---@field enabled boolean
+---@field clause_ms integer
+---@field sentence_ms integer
+---@field highlight boolean
+
+---@alias RsvpAutostop "off"|"paragraph"|"sentence"|"clause"
 
 ---@class Config
 ---@field keymaps Keymaps
@@ -78,6 +122,10 @@ local state = vim.deepcopy(initial_state)
 ---@field wpm_step_size integer
 ---@field progress_bar_width integer
 ---@field surrounding_word_count integer
+---@field complexity_scaling ComplexityScaling
+---@field breather Breather
+---@field paragraph_pause_ms integer
+---@field autostop RsvpAutostop
 ---@field colors RsvpColors
 local config = {
   keymaps = keymaps,
@@ -86,6 +134,30 @@ local config = {
   wpm_step_size = 25,
   progress_bar_width = 80,
   surrounding_word_count = 1,
+  complexity_scaling = {
+    enabled = false,
+    min_multiplier = 0.6,
+    max_multiplier = 3.0,
+    common_word_multiplier = 0.7,
+    word_list = { enabled = true },
+    weights = {
+      length_medium = 0.3,
+      length_long = 0.6,
+      length_very_long = 1.0,
+      has_digit = 0.4,
+      has_symbol = 0.5,
+      mixed_case = 0.5,
+      all_caps = 0.2,
+    },
+  },
+  breather = {
+    enabled = false,
+    clause_ms = 200,
+    sentence_ms = 400,
+    highlight = true,
+  },
+  paragraph_pause_ms = 0,
+  autostop = "off",
   colors = {},
 }
 
@@ -151,12 +223,51 @@ local function sanitize_surrounding_word_count(value)
   return math.floor(count)
 end
 
+local VALID_AUTOSTOP = {
+  off = true,
+  paragraph = true,
+  sentence = true,
+  clause = true,
+}
+
+---@param value any
+---@return RsvpAutostop
+local function sanitize_autostop(value)
+  if type(value) == "string" and VALID_AUTOSTOP[value] then
+    return value
+  end
+  return "off"
+end
+
+---@param value any
+---@param fallback number
+---@return number
+local function sanitize_non_negative(value, fallback)
+  local n = tonumber(value)
+  if n == nil or n < 0 then
+    return fallback
+  end
+  return n
+end
+
+local function sanitize_complexity_scaling()
+  local cs = M.config.complexity_scaling
+  cs.min_multiplier = math.max(0.1, sanitize_non_negative(cs.min_multiplier, 0.6))
+  cs.max_multiplier = math.max(cs.min_multiplier, sanitize_non_negative(cs.max_multiplier, 3.0))
+  cs.common_word_multiplier = sanitize_non_negative(cs.common_word_multiplier, 0.7)
+end
+
 ---@param args Config?
 -- you can define your setup function here. Usually configurations can be merged, accepting outside params and
 -- you can also put some validation here for those.
 M.setup = function(args)
   M.config = vim.tbl_deep_extend("force", M.config, args or {})
   M.config.surrounding_word_count = sanitize_surrounding_word_count(M.config.surrounding_word_count)
+  M.config.autostop = sanitize_autostop(M.config.autostop)
+  M.config.paragraph_pause_ms = sanitize_non_negative(M.config.paragraph_pause_ms, 0)
+  M.config.breather.clause_ms = sanitize_non_negative(M.config.breather.clause_ms, 200)
+  M.config.breather.sentence_ms = sanitize_non_negative(M.config.breather.sentence_ms, 400)
+  sanitize_complexity_scaling()
   state.wpm = M.config.initial_wpm
   init_highlights()
 end
@@ -303,11 +414,82 @@ local function get_orp_char_index(word)
   return alnum_positions[core_orp_index]
 end
 
+---@param trailing_punct string
+---@return "none"|"clause"|"sentence"
+local function classify_boundary(trailing_punct)
+  if trailing_punct == "" then
+    return "none"
+  end
+  if trailing_punct:match("[%.!%?]") then
+    return "sentence"
+  end
+  if trailing_punct:match("[,;:]") or trailing_punct:match("[%-–—]") then
+    return "clause"
+  end
+  return "none"
+end
+
+---@param core string
+---@return number
+local function length_weight(core)
+  local len = vim.fn.strchars(core)
+  local weights = M.config.complexity_scaling.weights
+  if len <= 4 then
+    return 0
+  elseif len <= 8 then
+    return weights.length_medium
+  elseif len <= 12 then
+    return weights.length_long
+  else
+    return weights.length_very_long
+  end
+end
+
+-- Computes the per-word display-time multiplier. Returns 1.0 (no change) when
+-- complexity scaling is disabled, so default playback is unaffected.
+---@param word string the full display token (including any surrounding chars)
+---@param core string the alphanumeric-stripped core
+---@return number
+local function complexity_multiplier(word, core)
+  local cs = M.config.complexity_scaling
+  if not cs.enabled or core == "" then
+    return 1.0
+  end
+
+  local weights = cs.weights
+  local has_symbol = word:match("[_%./\\:%-%(%)%[%]{}<>]") ~= nil
+  local has_digit = core:match("%d") ~= nil
+  local mixed_case = core:match("%l") ~= nil and core:match("%u") ~= nil
+  local plain_word = not (has_symbol or has_digit or mixed_case)
+
+  local mult
+  if cs.word_list.enabled and plain_word and common_words[core:lower()] then
+    mult = cs.common_word_multiplier
+  else
+    mult = 1.0 + length_weight(core)
+    if has_digit then
+      mult = mult + weights.has_digit
+    end
+    if has_symbol then
+      mult = mult + weights.has_symbol
+    end
+    if mixed_case then
+      mult = mult + weights.mixed_case
+    end
+    if vim.fn.strchars(core) > 1 and core:match("%a") and core == core:upper() then
+      mult = mult + weights.all_caps
+    end
+  end
+
+  return math.max(cs.min_multiplier, math.min(cs.max_multiplier, mult))
+end
+
 ---@param word_index integer
 ---@return string line
 ---@return integer orp_col_start
 ---@return integer orp_col_end
 ---@return { start_col: integer, end_col: integer }[] ghost_ranges
+---@return { start_col: integer, end_col: integer }? breather_range byte range of the active word's trailing punctuation
 local function build_orp_line(word_index)
   local word = state.words[word_index]
   local win_width = vim.api.nvim_win_get_width(state.win or 0)
@@ -366,13 +548,26 @@ local function build_orp_line(word_index)
     })
   end
 
-  return line, orp_byte_start, orp_byte_end, ghost_ranges
+  local breather_range = nil
+  local token = state.tokens and state.tokens[word_index]
+  if token and token.trailing_punct ~= "" then
+    local word_char_count = vim.fn.strchars(word)
+    local punct_char_count = vim.fn.strchars(token.trailing_punct)
+    local punct_start_char_index = current_word_start_char_index + (word_char_count - punct_char_count)
+    local punct_end_char_index = current_word_start_char_index + word_char_count
+    breather_range = {
+      start_col = start_col + vim.str_byteindex(displayed_words, "utf-32", punct_start_char_index),
+      end_col = start_col + vim.str_byteindex(displayed_words, "utf-32", punct_end_char_index),
+    }
+  end
+
+  return line, orp_byte_start, orp_byte_end, ghost_ranges, breather_range
 end
 
 ---@param word_index integer
 local function write_word(word_index)
   local line_number = math.floor(vim.o.lines / 2)
-  local line, orp_col_start, orp_col_end, surrounding_ranges = build_orp_line(word_index)
+  local line, orp_col_start, orp_col_end, surrounding_ranges, breather_range = build_orp_line(word_index)
 
   with_buffer_mutation(state.buf, function()
     vim.api.nvim_buf_set_lines(state.buf, line_number, line_number + 1, false, { line })
@@ -391,6 +586,22 @@ local function write_word(word_index)
         hl_group = HL_GROUPS.ghost_text,
       })
     end
+  end
+
+  local breather = M.config.breather
+  local token = state.tokens and state.tokens[word_index]
+  if
+    breather.enabled
+    and breather.highlight
+    and breather_range
+    and breather_range.end_col > breather_range.start_col
+    and token
+    and token.boundary ~= "none"
+  then
+    vim.api.nvim_buf_set_extmark(state.buf, hl_ns, line_number, breather_range.start_col, {
+      end_col = breather_range.end_col,
+      hl_group = HL_GROUPS.breather,
+    })
   end
 end
 
@@ -516,12 +727,135 @@ local function write_keymap_line()
   )
 end
 
+---@param token RsvpToken
+---@return number milliseconds added as a pause after the word (0 if disabled)
+local function breather_ms(token)
+  local breather = M.config.breather
+  if not breather.enabled then
+    return 0
+  end
+  if token.boundary == "sentence" then
+    return breather.sentence_ms
+  elseif token.boundary == "clause" then
+    return breather.clause_ms
+  end
+  return 0
+end
+
+-- How long the word at `index` stays on screen: base WPM interval scaled by the
+-- word's complexity, plus any punctuation breather. With all features disabled
+-- this reduces to the original fixed `60000 / wpm`.
+---@param index integer
+---@return number
+local function display_time(index)
+  local token = state.tokens[index]
+  local base = 60000 / state.wpm
+  return math.floor(base * token.complexity) + breather_ms(token)
+end
+
+---@param token RsvpToken
+---@return boolean
+local function autostop_should_stop(token)
+  local autostop = M.config.autostop
+  if autostop == "paragraph" then
+    return token.paragraph_end
+  elseif autostop == "sentence" then
+    return token.boundary == "sentence"
+  elseif autostop == "clause" then
+    return token.boundary == "sentence" or token.boundary == "clause"
+  end
+  return false
+end
+
+local function blank_reading_line()
+  local line_number = math.floor(vim.o.lines / 2)
+  with_buffer_mutation(state.buf, function()
+    vim.api.nvim_buf_set_lines(state.buf, line_number, line_number + 1, false, { "" })
+  end)
+  vim.api.nvim_buf_clear_namespace(state.buf, hl_ns, line_number, line_number + 1)
+end
+
+-- Renders the word at `state.current_index`, then schedules the next frame after
+-- the current word's display time. A single one-shot timer is re-armed each frame
+-- so per-word durations, paragraph blanks, and autostop can all be expressed.
+local function tick()
+  if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
+    clear_timer()
+    state.running = false
+    return
+  end
+
+  -- a pause may have been requested after this callback was already scheduled
+  if not state.running then
+    return
+  end
+
+  if state.current_index > #state.tokens then
+    clear_timer()
+    clear_elapsed_timer()
+    write_elapsed_time_line()
+
+    state.finished = true
+    state.running = false
+    return
+  end
+
+  local index = state.current_index
+  local token = state.tokens[index]
+
+  write_word(index)
+  write_status_line(index)
+  write_proggress_bar(index)
+
+  state.current_index = index + 1
+  vim.cmd("redraw")
+
+  local delay = display_time(index)
+
+  if autostop_should_stop(token) then
+    -- keep the boundary word (and its breather) on screen, then pause
+    state.timer:start(
+      delay,
+      0,
+      vim.schedule_wrap(function()
+        if state.running then
+          M.pause()
+        end
+      end)
+    )
+  elseif token.paragraph_end and M.config.paragraph_pause_ms > 0 then
+    -- show the word, then blank the screen for a beat before the next paragraph
+    state.in_paragraph_pause = true
+    state.timer:start(
+      delay,
+      0,
+      vim.schedule_wrap(function()
+        if not state.running then
+          state.in_paragraph_pause = false
+          return
+        end
+        blank_reading_line()
+        vim.cmd("redraw")
+        state.timer:start(
+          M.config.paragraph_pause_ms,
+          0,
+          vim.schedule_wrap(function()
+            state.in_paragraph_pause = false
+            tick()
+          end)
+        )
+      end)
+    )
+  else
+    state.timer:start(delay, 0, vim.schedule_wrap(tick))
+  end
+end
+
 M.play = function()
   if state.running or state.finished then
     return
   end
 
-  local interval = math.floor(60000 / state.wpm)
   state.running = true
   state.timer = vim.uv.new_timer()
 
@@ -537,34 +871,18 @@ M.play = function()
     end)
   )
 
-  state.timer:start(
-    interval,
-    interval,
-    vim.schedule_wrap(function()
-      if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
-        clear_timer()
-        state.running = false
-        return
-      end
+  -- The first frame waits for the dwell time of the word already on screen
+  -- (the one before current_index); when nothing is shown yet, fall back to the
+  -- base interval so auto-run starts after one beat like before.
+  local shown_index = state.current_index - 1
+  local initial_delay
+  if shown_index >= 1 and shown_index <= #state.tokens then
+    initial_delay = display_time(shown_index)
+  else
+    initial_delay = math.floor(60000 / state.wpm)
+  end
 
-      if state.current_index > #state.words then
-        clear_timer()
-        clear_elapsed_timer()
-        write_elapsed_time_line()
-
-        state.finished = true
-        state.running = false
-        return
-      end
-
-      write_word(state.current_index)
-      write_status_line(state.current_index)
-      write_proggress_bar(state.current_index)
-
-      state.current_index = state.current_index + 1
-      vim.cmd("redraw")
-    end)
-  )
+  state.timer:start(initial_delay, 0, vim.schedule_wrap(tick))
 end
 
 M.pause = function()
@@ -615,10 +933,8 @@ M.adjust_wpm = function(diff)
 
   state.wpm = new_wpm
   write_status_line()
-
-  if state.timer then
-    state.timer:set_repeat(math.floor(60000 / state.wpm))
-  end
+  -- The new WPM is read by display_time() when the next frame is scheduled, so
+  -- it takes effect from the next word without touching the running timer.
 end
 
 local function render_help()
@@ -771,25 +1087,61 @@ M.reset = function()
   start_session()
 end
 
+-- Splits the selected lines into structured tokens. Iterating line-by-line lets
+-- us detect blank lines (paragraph breaks) before the structure is flattened.
+---@param lines string[]
+---@return RsvpToken[]
+local function tokenize(lines)
+  local tokens = {}
+
+  for _, line in ipairs(lines) do
+    if line:match("^%s*$") then
+      -- blank line marks a paragraph break after the last accepted token
+      if #tokens > 0 then
+        tokens[#tokens].paragraph_end = true
+      end
+    else
+      for word in line:gmatch("%S+") do
+        local core = word:gsub("^[^%w]+", ""):gsub("[^%w]+$", "")
+        if core:match("%a") then
+          local trailing_punct = word:match("[^%w]+$") or ""
+          table.insert(tokens, {
+            word = word,
+            core = core,
+            trailing_punct = trailing_punct,
+            boundary = classify_boundary(trailing_punct),
+            paragraph_end = false,
+            complexity = complexity_multiplier(word, core),
+          })
+        end
+      end
+    end
+  end
+
+  return tokens
+end
+
 ---@param opts vim.api.keyset.create_user_command.command_args
 M.rsvp = function(opts)
   local start = opts.line1
   local end_ = opts.line2
 
-  local full_content = vim.api.nvim_buf_get_lines(0, start - 1, end_, false)
-  local full_content_str = table.concat(full_content, " ")
+  local lines = vim.api.nvim_buf_get_lines(0, start - 1, end_, false)
+  local tokens = tokenize(lines)
 
-  local words = {}
-  for token in full_content_str:gmatch("%S+") do
-    local core = token:gsub("^[^%w]+", ""):gsub("[^%w]+$", "")
-    if core:match("%a") then
-      table.insert(words, token)
-    end
-  end
-
-  if #words == 0 then
+  if #tokens == 0 then
     vim.notify("No words found", vim.log.levels.ERROR)
     return
+  end
+
+  state.tokens = tokens
+
+  -- `state.words` is kept as a parallel array of display strings so the
+  -- rendering/navigation code can keep indexing words while the timing code
+  -- reads the richer `state.tokens` metadata at the same index.
+  local words = {}
+  for i, token in ipairs(tokens) do
+    words[i] = token.word
   end
   state.words = words
 

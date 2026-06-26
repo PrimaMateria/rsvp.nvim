@@ -237,3 +237,38 @@ describe("rsvp step navigation", function()
     assert.are.equal(done_line_before, done_line_after)
   end)
 end)
+
+describe("rsvp breather highlighting", function()
+  before_each(function()
+    package.loaded.rsvp = nil
+    setup_rsvp()
+  end)
+
+  after_each(function()
+    close_floating_windows()
+  end)
+
+  it("highlights trailing punctuation when breather is enabled", function()
+    open_rsvp_session({ "hello, world." }, { breather = { enabled = true } })
+
+    local buf = vim.api.nvim_get_current_buf()
+    local line_idx = find_line_with(buf, "hello,")
+    assert.same({ "," }, get_line_extmark_texts(buf, line_idx, "RsvpBreather"))
+  end)
+
+  it("does not highlight a breather when disabled", function()
+    open_rsvp_session({ "hello, world." })
+
+    local buf = vim.api.nvim_get_current_buf()
+    local line_idx = find_line_with(buf, "hello,")
+    assert.same({}, get_line_extmark_texts(buf, line_idx, "RsvpBreather"))
+  end)
+
+  it("does not highlight a breather for a word without clause/sentence punctuation", function()
+    open_rsvp_session({ "(hello) world." }, { breather = { enabled = true } })
+
+    local buf = vim.api.nvim_get_current_buf()
+    local line_idx = find_line_with(buf, "(hello)")
+    assert.same({}, get_line_extmark_texts(buf, line_idx, "RsvpBreather"))
+  end)
+end)

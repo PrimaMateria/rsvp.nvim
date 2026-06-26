@@ -19,6 +19,19 @@ https://github.com/user-attachments/assets/01438201-3dd2-47c2-902c-79b34fd31954
 - Progress bar and completion elapsed time
 - Built-in help popup (`g?`)
 - Configurable speed step, progress width, and keymaps
+- Optional adaptive timing: complex/code-like words linger, common English words go faster
+- Optional punctuation "breathers": a pause (with the punctuation highlighted) at clause/sentence ends
+- Optional blank-screen hint between paragraphs
+- Optional autostop at paragraph / sentence / clause boundaries
+
+## Adaptive Timing
+
+By default every word is shown for the same `60000 / WPM` interval. The following **opt-in** options make the pace adaptive — when they are all disabled (the defaults), playback is identical to before.
+
+- **`complexity_scaling`** scales how long each word stays on screen. Long, symbol-heavy, mixed-case (`camelCase`), digit-bearing, or `ALL_CAPS` tokens linger so you can process them; common English words (matched against a bundled word list) speed up. The multiplier is clamped between `min_multiplier` and `max_multiplier`.
+- **`breather`** adds a pause _after_ a word that ends a clause (`, ; : -`) or a sentence (`. ! ?`), mirroring spoken pauses. While the word is shown, its trailing punctuation is highlighted with `RsvpBreather`.
+- **`paragraph_pause_ms`** blanks the reading line for the given number of milliseconds between paragraphs (detected from blank lines in the source) for a visual reset. `0` disables it.
+- **`autostop`** auto-pauses playback when it reaches a boundary so you resume deliberately with `<Space>`: `"paragraph"`, `"sentence"`, `"clause"`, or `"off"`.
 
 ## Optimal Recognition Point (ORP) Selection Logic
 
@@ -61,6 +74,32 @@ This example sets every option to its current default value. Keep this as a refe
     wpm_step_size = 25, -- Amount added/removed when changing WPM
     progress_bar_width = 80, -- Progress bar width in characters
     surrounding_word_count = 1, -- Show up to N words on each side of the active word (0..3, invalid => 1)
+    paragraph_pause_ms = 0, -- Blank-screen pause (ms) between paragraphs; 0 disables
+    autostop = "off", -- Auto-pause at boundaries: "off" | "paragraph" | "sentence" | "clause"
+    complexity_scaling = {
+      enabled = false, -- Scale display time by word complexity
+      min_multiplier = 0.6, -- Lower clamp (allows common words to speed up)
+      max_multiplier = 3.0, -- Upper clamp
+      common_word_multiplier = 0.7, -- Multiplier applied to recognized common English words
+      word_list = {
+        enabled = true, -- Speed up words found in the bundled common-words list
+      },
+      weights = { -- Additive complexity weights
+        length_medium = 0.3, -- 5..8 alphanumeric chars
+        length_long = 0.6, -- 9..12 chars
+        length_very_long = 1.0, -- 13+ chars
+        has_digit = 0.4, -- Contains a digit
+        has_symbol = 0.5, -- Contains a symbol/underscore (code-like)
+        mixed_case = 0.5, -- Mixed/camelCase
+        all_caps = 0.2, -- Multi-char ALL CAPS
+      },
+    },
+    breather = {
+      enabled = false, -- Pause after clause/sentence-ending punctuation
+      clause_ms = 200, -- Extra pause after , ; : -
+      sentence_ms = 400, -- Extra pause after . ! ?
+      highlight = true, -- Highlight the trailing punctuation (RsvpBreather)
+    },
     keymaps = {
       decrease_wpm = "<", -- Decrease WPM by `wpm_step_size`
       increase_wpm = ">", -- Increase WPM by `wpm_step_size`
@@ -84,6 +123,10 @@ This example sets every option to its current default value. Keep this as a refe
       },
       ghost_text = {
         link = "NonText",
+      },
+      breather = {
+        fg = "#FFA500",
+        bold = true,
       },
     },
   },
@@ -130,6 +173,7 @@ In-window defaults that are always available:
 | `RsvpPaused`    | `PAUSED` marker in the top status line when playback is paused.                                                                       |
 | `RsvpDone`      | `DONE` marker in the elapsed-time line shown after playback finishes.                                                                 |
 | `RsvpGhostText` | Unfinished part of the progress bar and surrounding words (when `surrounding_word_count > 0`).                                        |
+| `RsvpBreather`  | The trailing punctuation of the active word during a breather pause (when `breather.enabled` and `breather.highlight`).                |
 
 ## Similar Plugins
 
