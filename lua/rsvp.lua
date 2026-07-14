@@ -1087,6 +1087,12 @@ M.reset = function()
   start_session()
 end
 
+-- Matches a markdown list item marker at the start of a line (bullet or
+-- numbered), so each item can be treated as its own paragraph-like chunk.
+local function is_list_item(line)
+  return line:match("^%s*[%-%*%+]%s+") ~= nil or line:match("^%s*%d+[%.%)]%s+") ~= nil
+end
+
 -- Splits the selected lines into structured tokens. Iterating line-by-line lets
 -- us detect blank lines (paragraph breaks) before the structure is flattened.
 ---@param lines string[]
@@ -1114,6 +1120,12 @@ local function tokenize(lines)
             complexity = complexity_multiplier(word, core),
           })
         end
+      end
+
+      -- list items have no blank line between them, so mark the break here
+      -- to get an autostop/paragraph-pause after each item
+      if is_list_item(line) and #tokens > 0 then
+        tokens[#tokens].paragraph_end = true
       end
     end
   end

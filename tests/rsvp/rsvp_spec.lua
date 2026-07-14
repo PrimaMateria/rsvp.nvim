@@ -272,3 +272,31 @@ describe("rsvp breather highlighting", function()
     assert.same({}, get_line_extmark_texts(buf, line_idx, "RsvpBreather"))
   end)
 end)
+
+describe("rsvp autostop", function()
+  before_each(function()
+    package.loaded.rsvp = nil
+    setup_rsvp()
+  end)
+
+  after_each(function()
+    close_floating_windows()
+  end)
+
+  it("pauses after each markdown list item even without a blank line between them", function()
+    local rsvp = require("rsvp")
+    open_rsvp_session({ "- one two", "- three four" }, { autostop = "paragraph" })
+    rsvp.play()
+
+    local paused = vim.wait(2000, function()
+      local buf = vim.api.nvim_get_current_buf()
+      return line_contains(buf, "[PAUSED]")
+    end, 20)
+
+    assert.is_true(paused)
+
+    local buf = vim.api.nvim_get_current_buf()
+    find_line_with(buf, "two")
+    assert.is_false(line_contains(buf, "three"))
+  end)
+end)
