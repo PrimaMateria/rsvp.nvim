@@ -273,6 +273,53 @@ describe("rsvp breather highlighting", function()
   end)
 end)
 
+describe("rsvp markdown markers", function()
+  before_each(function()
+    package.loaded.rsvp = nil
+    setup_rsvp()
+  end)
+
+  after_each(function()
+    close_floating_windows()
+  end)
+
+  it("keeps heading markers attached to the first heading word", function()
+    open_rsvp_session({ "### Foo bar" })
+
+    local buf = vim.api.nvim_get_current_buf()
+    find_line_with(buf, "### Foo")
+  end)
+
+  it("keeps numbered list markers attached to the first item word", function()
+    local rsvp = require("rsvp")
+    open_rsvp_session({ "1. alpha beta", "2. gamma delta" })
+
+    local buf = vim.api.nvim_get_current_buf()
+    find_line_with(buf, "1. alpha")
+
+    rsvp.set_step(2)
+    find_line_with(buf, "2. gamma")
+  end)
+
+  it("keeps bullet markers attached to the first item word", function()
+    open_rsvp_session({ "- alpha beta" })
+
+    local buf = vim.api.nvim_get_current_buf()
+    find_line_with(buf, "- alpha")
+  end)
+
+  it("keeps standalone numbers as words", function()
+    local rsvp = require("rsvp")
+    open_rsvp_session({ "alpha 42 beta" })
+
+    rsvp.set_step(1)
+
+    local buf = vim.api.nvim_get_current_buf()
+    find_line_with(buf, "2/3")
+    find_line_with(buf, "42")
+  end)
+end)
+
 describe("rsvp autostop", function()
   before_each(function()
     package.loaded.rsvp = nil

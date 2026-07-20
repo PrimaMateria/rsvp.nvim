@@ -1093,6 +1093,22 @@ local function is_list_item(line)
   return line:match("^%s*[%-%*%+]%s+") ~= nil or line:match("^%s*%d+[%.%)]%s+") ~= nil
 end
 
+-- Peels a leading markdown marker (heading hashes, bullet, or list number) off
+-- the line so it can be re-attached to the line's first display word.
+---@param line string
+---@return string? marker
+---@return string content
+local function split_line_marker(line)
+  local patterns = { "^%s*(#+)%s+(.*)", "^%s*([%-%*%+])%s+(.*)", "^%s*(%d+[%.%)])%s+(.*)" }
+  for _, pattern in ipairs(patterns) do
+    local marker, content = line:match(pattern)
+    if marker then
+      return marker, content
+    end
+  end
+  return nil, line
+end
+
 -- Splits the selected lines into structured tokens. Iterating line-by-line lets
 -- us detect blank lines (paragraph breaks) before the structure is flattened.
 ---@param lines string[]
@@ -1107,17 +1123,23 @@ local function tokenize(lines)
         tokens[#tokens].paragraph_end = true
       end
     else
-      for word in line:gmatch("%S+") do
+      local marker, content = split_line_marker(line)
+      for word in content:gmatch("%S+") do
         local core = word:gsub("^[^%w]+", ""):gsub("[^%w]+$", "")
-        if core:match("%a") then
+        if core:match("%w") then
           local trailing_punct = word:match("[^%w]+$") or ""
+          local display = word
+          if marker then
+            display = marker .. " " .. word
+            marker = nil
+          end
           table.insert(tokens, {
-            word = word,
+            word = display,
             core = core,
             trailing_punct = trailing_punct,
             boundary = classify_boundary(trailing_punct),
             paragraph_end = false,
-            complexity = complexity_multiplier(word, core),
+            complexity = complexity_multiplier(display, core),
           })
         end
       end
